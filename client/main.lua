@@ -466,7 +466,7 @@ RegisterNetEvent('motel:client:tryOpenWardrobe', function(data)
         QBCore.Functions.Notify('Bu oda kilitli. Önce kiralamanız gerekiyor.', 'error')
         return
     end
-    TriggerEvent('illenium-appearance:client:openClothingOnly')
+    TriggerEvent('illenium-appearance:client:openOutfitsMenu')
 end)
 
 RegisterNetEvent('motel:client:roomRented', function(roomId)
