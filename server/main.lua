@@ -86,11 +86,21 @@ local function dumpRoomStashToLostFound(roomId)
     exports['codem-inventory']:UpdateStash(roomStashId(roomId), {})
 end
 
+--- Forces the physical qb-doorlock door shut (rental ended / just started), whoever left it open.
+local function relockDoor(roomId)
+    if not Config.UseDoorlock then return end
+    local ok = pcall(function() exports['qb-doorlock']:SetDoorLocked('motel-' .. roomId, true) end)
+    if not ok then
+        print(('^3[county-motel]^7 could not relock qb-doorlock door motel-%s (qb-doorlock not started?)'):format(tostring(roomId)))
+    end
+end
+
 local function endRental(roomId, reason)
     local rental = ActiveRentals[roomId]
     if not rental then return end
 
     dumpRoomStashToLostFound(roomId)
+    relockDoor(roomId)
 
     MySQL.update('UPDATE motel_rentals SET active = 0 WHERE id = ?', { rental.id })
 
@@ -140,8 +150,32 @@ lib.callback.register('motel:cb:getMyRoom', function(source)
     return nil
 end)
 
+--- Called once on client resource start (and on spawn) to sync which rooms should show as
+--- physically unlocked for this player -- otherwise a resource restart resets everyone's door
+--- blocker to "locked" with no way to know their own active rental/friend access.
+lib.callback.register('motel:cb:getMyUnlockedRooms', function(source)
+    local Player = QBCore.Functions.GetPlayer(source)
+    if not Player then return {} end
+    local cid = Player.PlayerData.citizenid
+    local roomIds = {}
+    for roomId, rental in pairs(ActiveRentals) do
+        if rental.citizenid == cid then
+            table.insert(roomIds, roomId)
+        else
+            for _, friendCid in ipairs(rental.friends) do
+                if friendCid == cid then
+                    table.insert(roomIds, roomId)
+                    break
+                end
+            end
+        end
+    end
+    return roomIds
+end)
+
 --- Server is the sole authority on room access; client only asks before animating the door/opening stash/wardrobe.
-lib.callback.register('motel:cb:canUseRoom', function(source, roomId)
+local function canUseRoom(source, roomId)
+    roomId = tonumber(roomId)
     local Player = QBCore.Functions.GetPlayer(source)
     local rental = ActiveRentals[roomId]
     if not Player or not rental then return false end
@@ -151,10 +185,17 @@ lib.callback.register('motel:cb:canUseRoom', function(source, roomId)
         if friendCid == cid then return true end
     end
     return false
-end)
+end
+
+lib.callback.register('motel:cb:canUseRoom', canUseRoom)
+
+-- qb-doorlock (configs/motel.lua, `motelRoom`) asks this on every E press on a room door.
+exports('CanUseRoom', canUseRoom)
 
 RegisterNetEvent('motel:server:rentRoom', function(roomId, durationIdx)
     local src = source
+    roomId = tonumber(roomId)
+    durationIdx = tonumber(durationIdx)
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
 
@@ -175,23 +216,38 @@ RegisterNetEvent('motel:server:rentRoom', function(roomId, durationIdx)
     end
 
     local price = duration.price
-    local funds = Player.PlayerData.money[Config.PaymentAccount] or 0
-    if funds < price then
-        Config.Notify(src, 'Yeterli paranız yok.', 'error')
+    -- Try cash first, fall back to bank -- player doesn't pick, whichever account covers it is used.
+    local cash = Player.PlayerData.money.cash or 0
+    local bank = Player.PlayerData.money.bank or 0
+    local payAccount = nil
+    if cash >= price then
+        payAccount = 'cash'
+    elseif bank >= price then
+        payAccount = 'bank'
+    else
+        Config.Notify(src, 'Ne nakit ne de banka hesabınızda yeterli para var.', 'error')
         return
     end
 
-    Player.Functions.RemoveMoney(Config.PaymentAccount, price, 'Motel oda kirası')
+    Player.Functions.RemoveMoney(payAccount, price, 'Motel oda kirası')
     exports['qb-banking']:AddMoney(Config.Job, price)
 
-    local rentedAt = os.date('%Y-%m-%d %H:%M:%S')
     local id = MySQL.insert.await(
-        'INSERT INTO motel_rentals (room_id, citizenid, rented_at, expires_at, friends, active) VALUES (?, NOW(), DATE_ADD(NOW(), INTERVAL ? HOUR), ?, 1)',
+        'INSERT INTO motel_rentals (room_id, citizenid, rented_at, expires_at, friends, active) VALUES (?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? HOUR), ?, 1)',
         { roomId, cid, duration.hours, json.encode({}) }
     )
+    if not id then
+        -- INSERT failed: refund immediately instead of letting the player believe they rented a
+        -- room that only exists in memory until the next restart (this exact bug happened once).
+        print(('^1[county-motel]^7 rentRoom INSERT failed for room %s, citizenid %s -- refunding'):format(tostring(roomId), cid))
+        Player.Functions.AddMoney(payAccount, price, 'Motel oda kirası (başarısız kayıt - iade)')
+        Config.Notify(src, 'Kiralama kaydedilemedi, paranız iade edildi. Tekrar deneyin.', 'error')
+        return
+    end
 
     local expiresAt = MySQL.scalar.await('SELECT expires_at FROM motel_rentals WHERE id = ?', { id })
     ActiveRentals[roomId] = { id = id, citizenid = cid, friends = {}, expiresAt = expiresAt }
+    relockDoor(roomId)
 
     Config.Notify(src, ('%s kiralandı: %s. $%s ödendi.'):format(room.label, duration.label, price), 'success')
     TriggerClientEvent('motel:client:roomRented', src, roomId)
@@ -199,6 +255,7 @@ end)
 
 RegisterNetEvent('motel:server:cancelRoom', function(roomId)
     local src = source
+    roomId = tonumber(roomId)
     local Player = QBCore.Functions.GetPlayer(src)
     local rental = ActiveRentals[roomId]
     if not Player or not rental or rental.citizenid ~= Player.PlayerData.citizenid then return end
@@ -215,6 +272,7 @@ end)
 
 RegisterNetEvent('motel:server:addFriend', function(roomId, targetCid)
     local src = source
+    roomId = tonumber(roomId)
     local Player = QBCore.Functions.GetPlayer(src)
     local rental = ActiveRentals[roomId]
     if not Player or not rental or rental.citizenid ~= Player.PlayerData.citizenid then return end
@@ -249,6 +307,7 @@ end)
 
 RegisterNetEvent('motel:server:removeFriend', function(roomId, targetCid)
     local src = source
+    roomId = tonumber(roomId)
     local Player = QBCore.Functions.GetPlayer(src)
     local rental = ActiveRentals[roomId]
     if not Player or not rental or rental.citizenid ~= Player.PlayerData.citizenid then return end
@@ -265,6 +324,7 @@ end)
 
 RegisterNetEvent('motel:server:openStash', function(roomId)
     local src = source
+    roomId = tonumber(roomId)
     local Player = QBCore.Functions.GetPlayer(src)
     local room = Config.Rooms[roomId]
     if not Player or not room then return end
@@ -282,6 +342,21 @@ RegisterNetEvent('motel:server:openStash', function(roomId)
 
     TriggerClientEvent('motel:client:doOpenStash', src, roomStashId(roomId), room.stashSlots, room.stashWeight, room.label .. ' Deposu')
 end)
+
+-- TEMP DEBUG (2026-10-17, remove once the room-lock bug is confirmed fixed): dumps ActiveRentals
+-- as-is so we can see the real key types/values instead of guessing.
+RegisterCommand('motelrentalsdebug', function(src)
+    if src == 0 then return end -- console only guard not needed; command is player-run
+    local lines = { '[county-motel] ActiveRentals dump:' }
+    for roomId, rental in pairs(ActiveRentals) do
+        table.insert(lines, ('  room %s (type %s) -> citizenid=%s id=%s expiresAt=%s'):format(
+            tostring(roomId), type(roomId), tostring(rental.citizenid), tostring(rental.id), tostring(rental.expiresAt)
+        ))
+    end
+    if #lines == 1 then table.insert(lines, '  (empty)') end
+    print(table.concat(lines, '\n'))
+    Config.Notify(src, 'Konsola yazıldı (F8).', 'primary')
+end, false)
 
 --- Reception desk, job-gated: motel employees/boss open the shared lost&found stash.
 RegisterNetEvent('motel:server:openLostFound', function()

@@ -1,4 +1,5 @@
 local QBCore = exports['qb-core']:GetCoreObject()
+local npc = nil -- declared early: referenced by /motelnpc below and the NPC spawn logic further down
 
 -- ===========================================================================
 -- Coordinate-capture admin commands (same pattern as mcLaw's /mclawpoaground):
@@ -6,16 +7,36 @@ local QBCore = exports['qb-core']:GetCoreObject()
 -- ===========================================================================
 
 --- /motelnokta: generic point capture (NPC, stash, wardrobe coords).
+-- Uses the player's own standing Z directly (no raycast) -- a downward raycast from above can hit
+-- an overhang/railing/upper floor instead of the real ground, which is what happened at the motel
+-- desk spot (2026-10-17). The player is, by definition, already standing on valid ground.
 RegisterCommand('motelnokta', function()
     local coords = GetEntityCoords(PlayerPedId())
     local heading = GetEntityHeading(PlayerPedId())
-    local groundZ = coords.z
-    local found, z = GetGroundZFor_3dCoord(coords.x, coords.y, coords.z + 5.0, false)
-    if found then groundZ = z end
     print(('[county-motel] vector3(%.2f, %.2f, %.2f)  |  vector4(%.2f, %.2f, %.2f, %.2f)'):format(
-        coords.x, coords.y, groundZ, coords.x, coords.y, groundZ, heading
+        coords.x, coords.y, coords.z, coords.x, coords.y, coords.z, heading
     ))
     QBCore.Functions.Notify('Koordinat konsola yazıldı (F8).', 'primary')
+end, false)
+
+--- /motelnpc: diagnostic. Prints distance to the configured NPC spot and whether the ped has spawned.
+RegisterCommand('motelnpc', function()
+    local playerCoords = GetEntityCoords(PlayerPedId())
+    local c = Config.NPC.coords
+    local dist = #(playerCoords - vector3(c.x, c.y, c.z))
+    local exists = npc ~= nil and DoesEntityExist(npc)
+    print(('[county-motel] dist to NPC spot: %.1f (viewDistance=%.1f)  |  model "%s" loaded: %s  |  npc spawned: %s'):format(
+        dist, Config.NPC.viewDistance, Config.NPC.model, tostring(HasModelLoaded(GetHashKey(Config.NPC.model))),
+        tostring(exists)
+    ))
+    if exists then
+        local npcCoords = GetEntityCoords(npc)
+        print(('[county-motel] npc actual coords: %.2f, %.2f, %.2f  |  player z: %.2f  |  z diff (player-npc): %.2f  |  npc visible: %s  |  npc alive: %s'):format(
+            npcCoords.x, npcCoords.y, npcCoords.z, playerCoords.z, playerCoords.z - npcCoords.z,
+            tostring(IsEntityVisible(npc)), tostring(not IsEntityDead(npc))
+        ))
+    end
+    QBCore.Functions.Notify(('Mesafe: %.1f'):format(dist), 'primary')
 end, false)
 
 --- /motelkapi: look at the door entity, run the command -> prints door model hash + coords + heading.
@@ -53,8 +74,6 @@ end
 -- Reception NPC
 -- ===========================================================================
 
-local npc = nil
-
 local function spawnNpc()
     if npc and DoesEntityExist(npc) then return end
     local model = GetHashKey(Config.NPC.model)
@@ -70,7 +89,8 @@ local function spawnNpc()
     end
 
     local c = Config.NPC.coords
-    npc = CreatePed(4, model, c.x, c.y, c.z - 1.0, c.w, false, false)
+    -- c.z is already real ground height (/motelnokta raycasts it) -> no extra offset needed here.
+    npc = CreatePed(4, model, c.x, c.y, c.z, c.w, false, false)
     SetEntityInvincible(npc, true)
     FreezeEntityPosition(npc, true)
     SetBlockingOfNonTemporaryEvents(npc, true)
@@ -274,52 +294,127 @@ RegisterNetEvent('motel:client:openRoomPick', openRoomPickMenu)
 -- Rooms: door lock, stash, wardrobe
 -- ===========================================================================
 
--- AddDoorToSystem wants a unique joaat-style hash, not a small sequential int (collision risk with
--- the game's own door IDs) -> derive one per room from its id.
-local function doorHash(roomId)
-    return GetHashKey('county_motel_door_' .. roomId)
+-- 2026-10-17: confirmed in-game that SetEntityCoords-based correction is what caused the vertical
+-- hop (with enforcement fully disabled, walking through was completely clean -- so it's our
+-- position-override fighting the ped's own animation/ground state, not the map). Back to a real
+-- collision object instead of faking it with coordinates. Made visible (DEBUG_VISIBLE) for now so
+-- we can actually see whether it blocks on contact, not guess from "could I walk through or not".
+local DEBUG_VISIBLE_BARRIERS = true -- 2026-10-17 TEMP: set false once confirmed working
+
+local roomLocked = {} -- roomId -> bool, defaults to true (locked)
+local lockBarriers = {} -- roomId -> object handle, only present while locked
+for roomId in pairs(Config.Rooms) do
+    roomLocked[roomId] = true
 end
+
+local function destroyBarrier(roomId)
+    if lockBarriers[roomId] and DoesEntityExist(lockBarriers[roomId]) then
+        DeleteEntity(lockBarriers[roomId])
+    end
+    lockBarriers[roomId] = nil
+end
+
+local function spawnBarrier(roomId)
+    if lockBarriers[roomId] and DoesEntityExist(lockBarriers[roomId]) then return end
+    local room = Config.Rooms[roomId]
+    if not room then return end
+    local c = room.doorCoords
+    local model = room.doorModel
+    RequestModel(model)
+    local attempts = 0
+    while not HasModelLoaded(model) and attempts < 100 do
+        Wait(10)
+        attempts = attempts + 1
+    end
+    if not HasModelLoaded(model) then
+        print(('^1[county-motel]^7 barrier model failed to load for room %s'):format(tostring(roomId)))
+        return
+    end
+
+    local barrier = CreateObject(model, c.x, c.y, c.z, false, false, false)
+    SetEntityHeading(barrier, c.w)
+    SetEntityVisible(barrier, DEBUG_VISIBLE_BARRIERS, false)
+    FreezeEntityPosition(barrier, true)
+    SetEntityCollision(barrier, true, true)
+    Wait(50) -- give the physics/collision a moment to register before we trust it
+    ActivatePhysics(barrier)
+    SetModelAsNoLongerNeeded(model)
+    lockBarriers[roomId] = barrier
+    print(('[county-motel] barrier spawned for room %s: exists=%s collidable=%s'):format(
+        tostring(roomId), tostring(DoesEntityExist(barrier)), tostring(GetEntityCollisionDisabled and not GetEntityCollisionDisabled(barrier) or 'n/a')
+    ))
+end
+
+local function setRoomLocked(roomId, locked)
+    roomLocked[roomId] = locked
+    if Config.UseDoorlock then return end -- qb-doorlock owns the physical door
+    if locked then
+        spawnBarrier(roomId)
+    else
+        destroyBarrier(roomId)
+    end
+end
+
+-- Sync with the server once on start: a resource restart resets every client's roomLocked table
+-- to "all locked", with no memory of who actually has an active rental/friend access.
+CreateThread(function()
+    Wait(2000) -- let qb-core/ox_lib finish initializing
+    local unlockedRoomIds = lib.callback.await('motel:cb:getMyUnlockedRooms', false)
+    for _, roomId in ipairs(unlockedRoomIds or {}) do
+        setRoomLocked(roomId, false)
+    end
+end)
 
 local function registerRoomDoors()
     for roomId, room in pairs(Config.Rooms) do
         local c = room.doorCoords
-        local hash = doorHash(roomId)
-        AddDoorToSystem(hash, room.doorModel, c.x, c.y, c.z, false, false, false)
-        DoorSystemSetDoorState(hash, 1, false, false) -- 1 = locked
+        setRoomLocked(roomId, true)
 
-        exports['qb-target']:AddBoxZone('motel_door_' .. roomId, vector3(c.x, c.y, c.z), 1.0, 1.0, {
-            name = 'motel_door_' .. roomId,
-            heading = c.w,
-            minZ = c.z - 1.0,
-            maxZ = c.z + 1.0,
-        }, {
-            options = {
-                { type = 'client', event = 'motel:client:tryEnterRoom', icon = 'fas fa-door-open', label = 'Odaya Gir / Çık', roomId = roomId },
-            },
-            distance = 2.0,
-        })
+        if not Config.UseDoorlock then
+            exports['qb-target']:AddBoxZone('motel_door_' .. roomId, vector3(c.x, c.y, c.z), 1.0, 1.0, {
+                name = 'motel_door_' .. roomId,
+                heading = c.w,
+                minZ = c.z - 1.0,
+                maxZ = c.z + 1.0,
+            }, {
+                options = {
+                    { type = 'client', event = 'motel:client:tryEnterRoom', icon = 'fas fa-door-open', label = room.label .. ' - Aç', roomId = roomId },
+                    { type = 'client', event = 'motel:client:tryLockRoom', icon = 'fas fa-lock', label = room.label .. ' - Kilitle', roomId = roomId },
+                },
+                distance = 2.0,
+            })
+        end
 
-        exports['qb-target']:AddBoxZone('motel_stash_' .. roomId, room.stashCoords, 1.0, 1.0, {
-            name = 'motel_stash_' .. roomId,
-            minZ = room.stashCoords.z - 1.0,
-            maxZ = room.stashCoords.z + 1.0,
-        }, {
-            options = {
-                { type = 'client', event = 'motel:client:tryOpenStash', icon = 'fas fa-box', label = 'Depo', roomId = roomId },
-            },
-            distance = 2.0,
-        })
+        -- Skip stash/wardrobe zones while their coords are still the door-coords placeholder
+        -- (shared/config.lua) -- otherwise they stack on top of the door target, which is confusing.
+        local hasStash = room.stashCoords.x ~= c.x or room.stashCoords.y ~= c.y or room.stashCoords.z ~= c.z
+        local hasWardrobe = room.wardrobeCoords.x ~= c.x or room.wardrobeCoords.y ~= c.y or room.wardrobeCoords.z ~= c.z
 
-        exports['qb-target']:AddBoxZone('motel_wardrobe_' .. roomId, room.wardrobeCoords, 1.0, 1.0, {
-            name = 'motel_wardrobe_' .. roomId,
-            minZ = room.wardrobeCoords.z - 1.0,
-            maxZ = room.wardrobeCoords.z + 1.0,
-        }, {
-            options = {
-                { type = 'client', event = 'motel:client:tryOpenWardrobe', icon = 'fas fa-shirt', label = 'Kıyafet Değiştir', roomId = roomId },
-            },
-            distance = 2.0,
-        })
+        if hasStash then
+            exports['qb-target']:AddBoxZone('motel_stash_' .. roomId, room.stashCoords, 1.0, 1.0, {
+                name = 'motel_stash_' .. roomId,
+                minZ = room.stashCoords.z - 1.0,
+                maxZ = room.stashCoords.z + 1.0,
+            }, {
+                options = {
+                    { type = 'client', event = 'motel:client:tryOpenStash', icon = 'fas fa-box', label = room.label .. ' - Depo', roomId = roomId },
+                },
+                distance = 2.0,
+            })
+        end
+
+        if hasWardrobe then
+            exports['qb-target']:AddBoxZone('motel_wardrobe_' .. roomId, room.wardrobeCoords, 1.0, 1.0, {
+                name = 'motel_wardrobe_' .. roomId,
+                minZ = room.wardrobeCoords.z - 1.0,
+                maxZ = room.wardrobeCoords.z + 1.0,
+            }, {
+                options = {
+                    { type = 'client', event = 'motel:client:tryOpenWardrobe', icon = 'fas fa-shirt', label = room.label .. ' - Kıyafet Değiştir', roomId = roomId },
+                },
+                distance = 2.0,
+            })
+        end
     end
 end
 
@@ -335,15 +430,26 @@ AddEventHandler('onResourceStart', function(resource)
     end
 end)
 
+-- 2026-10-17: removed the always-on 3D text loop (caused stutter). Room names are shown through
+-- the qb-target option labels only (room.label .. ' - ...' set on each AddBoxZone above).
+
 RegisterNetEvent('motel:client:tryEnterRoom', function(data)
-    local allowed = lib.callback.await('motel:cb:canUseRoom', false, data.roomId)
+    local roomId = tonumber(data.roomId)
+    local allowed = lib.callback.await('motel:cb:canUseRoom', false, roomId)
     if not allowed then
         QBCore.Functions.Notify('Bu oda kilitli. Önce kiralamanız gerekiyor.', 'error')
         return
     end
-    local hash = doorHash(data.roomId)
-    local newState = DoorSystemGetDoorState(hash) == 1 and 0 or 1
-    DoorSystemSetDoorState(hash, newState, false, false)
+    setRoomLocked(roomId, false)
+    QBCore.Functions.Notify('Oda açıldı.', 'primary')
+end)
+
+RegisterNetEvent('motel:client:tryLockRoom', function(data)
+    local roomId = tonumber(data.roomId)
+    local allowed = lib.callback.await('motel:cb:canUseRoom', false, roomId)
+    if not allowed then return end
+    setRoomLocked(roomId, true)
+    QBCore.Functions.Notify('Oda kilitlendi.', 'primary')
 end)
 
 RegisterNetEvent('motel:client:tryOpenStash', function(data)
@@ -364,11 +470,11 @@ RegisterNetEvent('motel:client:tryOpenWardrobe', function(data)
 end)
 
 RegisterNetEvent('motel:client:roomRented', function(roomId)
-    DoorSystemSetDoorState(doorHash(roomId), 0, false, false)
+    setRoomLocked(roomId, false)
 end)
 
 RegisterNetEvent('motel:client:roomEnded', function(roomId)
-    DoorSystemSetDoorState(doorHash(roomId), 1, false, false)
+    setRoomLocked(roomId, true)
 end)
 
 -- Reception desk: motel employees/boss open the shared lost&found stash (separate target option on the NPC).
